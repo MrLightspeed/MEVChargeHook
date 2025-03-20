@@ -14,10 +14,7 @@ contract HookFactory {
      * @param owner The desired owner of the hook.
      * @return hookAddress The address of the deployed hook.
      */
-    function deployHook(bytes32 salt, address poolManager, address owner)
-        external
-        returns (address hookAddress)
-    {
+    function deployHook(bytes32 salt, address poolManager, address owner) external returns (address hookAddress) {
         hookAddress = address(new MEVChargeHook{salt: salt}(IPoolManager(poolManager), owner));
         emit HookDeployed(hookAddress, salt);
     }

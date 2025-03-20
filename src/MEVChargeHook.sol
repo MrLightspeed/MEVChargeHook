@@ -48,7 +48,9 @@ contract MEVChargeHook is BaseHook, Ownable {
     event FeeAddressAdded(address indexed addr);
     event FeeAddressRemoved(address indexed addr);
     event LiquidityAdded(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
-    event LiquidityRemoved(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
+    event LiquidityRemoved(
+        address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data
+    );
 
     // --------------------------------- Errors ---------------------------------------------
     error ZeroAddress();
@@ -64,10 +66,7 @@ contract MEVChargeHook is BaseHook, Ownable {
     // --------------------------------- Constructor ----------------------------------------
     /// @param _poolManager Uniswap V4 PoolManager (non-zero address).
     /// @param _owner Owner address (non-zero).
-    constructor(IPoolManager _poolManager, address _owner)
-        BaseHook(_poolManager)
-        Ownable(_owner)
-    {
+    constructor(IPoolManager _poolManager, address _owner) BaseHook(_poolManager) Ownable(_owner) {
         if (address(_poolManager) == address(0)) revert InvalidPoolManagerAddress();
         if (_owner == address(0)) revert ZeroAddress();
         poolManager = _poolManager;
@@ -106,7 +105,7 @@ contract MEVChargeHook is BaseHook, Ownable {
     /// @param addr Address to flag.
     function addFeeAddress(address addr) external onlyOwner {
         if (addr == address(0)) revert ZeroAddress();
-        UserData storage user = _userData[addr];  // Cache in storage pointer
+        UserData storage user = _userData[addr]; // Cache in storage pointer
         if (user.isFeeAddress) revert AlreadyMarked();
         user.isFeeAddress = true;
         emit FeeAddressAdded(addr);
@@ -173,7 +172,7 @@ contract MEVChargeHook is BaseHook, Ownable {
      * @notice Calculates time-based fee using reversed sqrt decay with UD60x18 precision.
      * @dev Correctly scales values by 1e18 (fixed-point) for UD60x18 compatibility to maintain precision during division and sqrt.
      * @param cachedUser Reference to the stored user data.
-      *@return fee The calculated fee in basis points.
+     * @return fee The calculated fee in basis points.
      */
     function _calculateTimeFee(UserData storage cachedUser) private view returns (uint256 fee) {
         uint256 lastActivityTimestamp = cachedUser.lastActivityTimestamp;
@@ -203,14 +202,13 @@ contract MEVChargeHook is BaseHook, Ownable {
      * @param timeFee Previously computed time-based fee.
      * @return impactFee Calculated fee in basis points, capped explicitly at _MALICIOUS_FEE_MAX.
      */
-    function _calculateImpactFee(
-        PoolKey calldata poolKey,
-        IPoolManager.SwapParams calldata swapParams,
-        uint256 timeFee
-    ) private view returns (uint256 impactFee) {
-        uint256 absAmount = swapParams.amountSpecified >= 0
-            ? uint256(swapParams.amountSpecified)
-            : uint256(-swapParams.amountSpecified);
+    function _calculateImpactFee(PoolKey calldata poolKey, IPoolManager.SwapParams calldata swapParams, uint256 timeFee)
+        private
+        view
+        returns (uint256 impactFee)
+    {
+        uint256 absAmount =
+            swapParams.amountSpecified >= 0 ? uint256(swapParams.amountSpecified) : uint256(-swapParams.amountSpecified);
 
         uint128 liquidity = _getPoolLiquidity(poolKey);
         if (liquidity == 0) revert NoLiquidity();
@@ -241,17 +239,10 @@ contract MEVChargeHook is BaseHook, Ownable {
         }
     }
 
-
     /// @dev Retrieves pool liquidity from Uniswap V4 Pool.
     function _getPoolLiquidity(PoolKey calldata poolKey) private view returns (uint128 liquidity) {
         address poolAddr = IPoolManagerExtended(address(poolManager)).pools(
-            keccak256(abi.encode(
-                poolKey.currency0,
-                poolKey.currency1,
-                poolKey.fee,
-                poolKey.tickSpacing,
-                poolKey.hooks
-            ))
+            keccak256(abi.encode(poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks))
         );
         liquidity = IUniswapV4Pool(poolAddr).liquidity();
     }
@@ -271,12 +262,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         PoolKey calldata poolKey,
         IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata data
-    )
-        internal
-        virtual
-        override
-        returns (bytes4 selector)
-    {
+    ) internal virtual override returns (bytes4 selector) {
         if (user == address(0)) revert ZeroAddress();
 
         UserData storage cachedUser = _userData[user];
@@ -307,12 +293,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         PoolKey calldata poolKey,
         IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata data
-    )
-        internal
-        virtual
-        override
-        returns (bytes4 selector)
-    {
+    ) internal virtual override returns (bytes4 selector) {
         if (user == address(0)) revert ZeroAddress();
 
         UserData storage cachedUser = _userData[user];
