@@ -1,0 +1,26 @@
+# Compiler output
+cache/
+out/
+
+# Development broadcast logs
+broadcast/*
+
+# Foundry test artifacts and snapshots
+snapshots/
+coverage/
+
+# Local environment variables (Sensitive Information!)
+.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE and editor-specific files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

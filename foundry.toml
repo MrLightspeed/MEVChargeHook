@@ -1,0 +1,27 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+script = "scripts"
+test = "test"
+solc_version = "0.8.29"
+optimizer = true
+optimizer_runs = 10000
+gas_reports = ["*"]
+ffi = false
+verbosity = 2
+via_ir = false
+
+# RPC Configuration
+[rpc_endpoints]
+mainnet = "${RPC_URL}"
+localhost = "http://127.0.0.1:8545"
+
+# Etherscan Verification
+[etherscan]
+mainnet = { key = "${ETHERSCAN_API_KEY}" }
+
+# Named Addresses
+[profile.default.named_addresses]
+deployer = "${DEPLOYER_ADDRESS}"
+pool_manager = "0x000000000004444c5dc75cB358380D2e3dE08A90"
