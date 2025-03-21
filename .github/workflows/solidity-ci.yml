@@ -7,29 +7,23 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  build-test-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
 
       - name: Install Dependencies
         run: forge install
 
-      - name: Compile Contracts
-        run: forge build
+      - name: Check Formatting
+        run: forge fmt --check
 
-      - name: Check if Tests Exist
-        id: check-tests      # <--- Assign an ID here
-        run: |
-          if [ -z "$(find test -name '*.t.sol' 2>/dev/null)" ]; then
-            echo "No tests found. Skipping..."
-            echo "skip_tests=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip_tests=false" >> "$GITHUB_OUTPUT"
-          fi
-        shell: bash
+      - name: Compile Contracts
+        run: forge build --sizes
 
       - name: Run Tests
-        if: steps.check-tests.outputs.skip_tests == 'false'
-        run: forge test
+        run: forge test -vvv
