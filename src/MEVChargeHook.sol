@@ -92,6 +92,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         uint128 token1Fees;
     }
     // Maps poolId => total accrued fees (bookkeeping only)
+
     mapping(bytes32 poolId => PoolFees fees) public poolFees;
 
     // Mapping of poolId => token0, poolId => token1
@@ -100,16 +101,19 @@ contract MEVChargeHook is BaseHook, Ownable {
 
     // ----------------------------- Swap Tracking ------------------------------------------
     uint32 constant MAX_HISTORY_LENGTH = 256;
+
     struct SwapEntry {
         uint32 blockNumber;
         bool direction; // true if buy; false if sell
         uint256 amount;
     }
+
     struct SwapHistory {
         SwapEntry[MAX_HISTORY_LENGTH] swaps;
         uint32 nextIndex;
     }
     // user => SwapHistory
+
     mapping(address user => SwapHistory history) private _swapHistories;
 
     // ----------------------------- User Data ---------------------------------------------
@@ -117,6 +121,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         uint64 lastActivityTimestamp;
         bool isFeeAddress;
     }
+
     mapping(address userAddress => UserData userData) public _userData;
 
     // ----------------------------- Multi-Address Detection --------------------------------
@@ -260,12 +265,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         poolId = keccak256(abi.encode(part1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks));
     }
 
-    function _transferFees(
-        bytes32 poolId,
-        uint128 token0Amount,
-        uint128 token1Amount,
-        address poolAddr
-    ) internal {
+    function _transferFees(bytes32 poolId, uint128 token0Amount, uint128 token1Amount, address poolAddr) internal {
         if (token0Amount != 0) {
             IERC20(poolToken0[poolId]).safeTransfer(poolAddr, token0Amount);
         }
@@ -345,9 +345,7 @@ contract MEVChargeHook is BaseHook, Ownable {
                 poolAddr
             );
             _accrueFees(
-                poolId,
-                _amtSpecified < 0 ? uint128(extraFeeAmount) : 0,
-                _amtSpecified < 0 ? 0 : uint128(extraFeeAmount)
+                poolId, _amtSpecified < 0 ? uint128(extraFeeAmount) : 0, _amtSpecified < 0 ? 0 : uint128(extraFeeAmount)
             );
             emit FeesAccrued(
                 poolId,
@@ -357,11 +355,11 @@ contract MEVChargeHook is BaseHook, Ownable {
         }
     }
 
-    function _calculateTimeFee(
-        UserData storage cachedUser,
-        uint256 _feeMin,
-        uint256 _feeMax
-    ) private view returns (uint256 fee) {
+    function _calculateTimeFee(UserData storage cachedUser, uint256 _feeMin, uint256 _feeMax)
+        private
+        view
+        returns (uint256 fee)
+    {
         uint256 lastActivity = cachedUser.lastActivityTimestamp;
         if (lastActivity == 0) {
             return _feeMin;
@@ -419,16 +417,10 @@ contract MEVChargeHook is BaseHook, Ownable {
         SwapEntry storage lastSwap = _swapHistories[user].swaps[lastIdx];
         bool isSingleBlockSandwich = (block.number == lastSwap.blockNumber && lastSwap.direction != isBuy);
         bool isMultiBlockSandwich = (
-            block.number > lastSwap.blockNumber &&
-            block.number <= (lastSwap.blockNumber + _MULTI_BLOCK_SANDWICH_WINDOW) &&
-            lastSwap.direction != isBuy
+            block.number > lastSwap.blockNumber && block.number <= (lastSwap.blockNumber + _MULTI_BLOCK_SANDWICH_WINDOW)
+                && lastSwap.direction != isBuy
         );
-        return (
-            multiAddrAttack ||
-            _userData[user].isFeeAddress ||
-            isSingleBlockSandwich ||
-            isMultiBlockSandwich
-        );
+        return (multiAddrAttack || _userData[user].isFeeAddress || isSingleBlockSandwich || isMultiBlockSandwich);
     }
 
     function _isMultiAddressAttack(address user) private view returns (bool) {
@@ -494,6 +486,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         emit LiquidityAdded(user, poolKey, params, data);
         selector = BaseHook.beforeAddLiquidity.selector;
     }
+
     event LiquidityAdded(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
 
     function _beforeRemoveLiquidity(
@@ -513,7 +506,10 @@ contract MEVChargeHook is BaseHook, Ownable {
         emit LiquidityRemoved(user, poolKey, params, data);
         selector = BaseHook.beforeRemoveLiquidity.selector;
     }
-    event LiquidityRemoved(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
+
+    event LiquidityRemoved(
+        address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data
+    );
 
     // ----------------------------- Fee Accrual & Emergency --------------------------------
     function _accrueFees(bytes32 poolId, uint128 token0Amount, uint128 token1Amount) internal {
