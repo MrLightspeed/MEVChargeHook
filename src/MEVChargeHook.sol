@@ -82,17 +82,17 @@ contract MEVChargeHook is BaseHook, Ownable {
     using SafeERC20 for IERC20;
 
     // ----------------------------- Constants ----------------------------------------------
-    uint256 private constant _MAX_COOLDOWN_SECONDS       = 600;
-    uint256 private constant _MALICIOUS_FEE_MAX          = 2500; // 25%
-    uint256 private constant _FEE_DENOMINATOR            = 10000;
-    uint256 private constant _NULL_FEE_CAP               = 1000; // 10% in basis points
-    uint256 private constant MULTI_BLOCK_SANDWICH_WINDOW = 5;    // in blocks
+    uint256 private constant _MAX_COOLDOWN_SECONDS = 600;
+    uint256 private constant _MALICIOUS_FEE_MAX = 2500; // 25%
+    uint256 private constant _FEE_DENOMINATOR = 10000;
+    uint256 private constant _NULL_FEE_CAP = 1000; // 10% in basis points
+    uint256 private constant MULTI_BLOCK_SANDWICH_WINDOW = 5; // in blocks
 
     // ----------------------------- Configurable Params -------------------------------------
     uint256 public cooldownSeconds = 12;
-    uint256 public feeMin          = 100; // 1%
-    uint256 public feeMax          = 500; // 5%
-    uint256 public minSwapAmount   = 1e6;
+    uint256 public feeMin = 100; // 1%
+    uint256 public feeMax = 500; // 5%
+    uint256 public minSwapAmount = 1e6;
     uint256 public surgeFeeThreshold = 1000; // 10%
 
     // ----------------------------- Fee Redistribution -------------------------------------
@@ -100,28 +100,33 @@ contract MEVChargeHook is BaseHook, Ownable {
         uint128 token0Fees;
         uint128 token1Fees;
     }
+
     mapping(bytes32 => PoolFees) public poolFees;
     mapping(bytes32 => address) public poolToken0;
     mapping(bytes32 => address) public poolToken1;
 
     // ----------------------------- Swap Tracking ------------------------------------------
     uint32 constant MAX_HISTORY_LENGTH = 256;
+
     struct SwapEntry {
         uint32 blockNumber;
-        bool   direction; // true if buy; false if sell
+        bool direction; // true if buy; false if sell
         uint256 amount;
     }
+
     struct SwapHistory {
         SwapEntry[MAX_HISTORY_LENGTH] swaps;
         uint32 nextIndex;
     }
+
     mapping(address => SwapHistory) private _swapHistories;
 
     // ----------------------------- User Data ---------------------------------------------
     struct UserData {
         uint64 lastActivityTimestamp;
-        bool   isFeeAddress;
+        bool isFeeAddress;
     }
+
     mapping(address => UserData) public _userData;
 
     // ----------------------------- Multi-Address Detection --------------------------------
@@ -134,7 +139,9 @@ contract MEVChargeHook is BaseHook, Ownable {
     event FeeAddressAdded(address indexed addr);
     event FeeAddressRemoved(address indexed addr);
     event LiquidityAdded(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
-    event LiquidityRemoved(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
+    event LiquidityRemoved(
+        address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data
+    );
     event PoolTokensRegistered(bytes32 indexed poolId, address token0, address token1);
     event EmergencyWithdrawal(address token, uint256 amount);
 
@@ -253,9 +260,8 @@ contract MEVChargeHook is BaseHook, Ownable {
         if (recipient == address(0)) revert ZeroAddress();
 
         // Enforce minimum swap amount.
-        uint256 absAmount = swapParams.amountSpecified >= 0
-            ? uint256(swapParams.amountSpecified)
-            : uint256(-swapParams.amountSpecified);
+        uint256 absAmount =
+            swapParams.amountSpecified >= 0 ? uint256(swapParams.amountSpecified) : uint256(-swapParams.amountSpecified);
         if (absAmount < minSwapAmount) revert SwapAmountTooLow();
 
         // 1) Calculate fee and optionally accrue extra fees.
@@ -273,11 +279,7 @@ contract MEVChargeHook is BaseHook, Ownable {
 
         // 3) Record swap.
         bool isBuy = swapParams.amountSpecified >= 0;
-        _recordSwap(recipient, SwapEntry({
-            blockNumber: uint32(block.number),
-            direction: isBuy,
-            amount: absAmount
-        }));
+        _recordSwap(recipient, SwapEntry({blockNumber: uint32(block.number), direction: isBuy, amount: absAmount}));
 
         selector = BaseHook.beforeSwap.selector;
         delta = BeforeSwapDeltaLibrary.ZERO_DELTA;
@@ -339,11 +341,11 @@ contract MEVChargeHook is BaseHook, Ownable {
         }
     }
 
-    function _calculateImpactFee(
-        PoolKey calldata poolKey,
-        IPoolManager.SwapParams calldata swapParams,
-        uint256 timeFee
-    ) private view returns (uint256 impactFee) {
+    function _calculateImpactFee(PoolKey calldata poolKey, IPoolManager.SwapParams calldata swapParams, uint256 timeFee)
+        private
+        view
+        returns (uint256 impactFee)
+    {
         if (swapParams.amountSpecified >= 0) {
             return timeFee;
         }
@@ -376,9 +378,8 @@ contract MEVChargeHook is BaseHook, Ownable {
         SwapEntry memory lastSwap = history.swaps[lastIdx];
         bool isSingleBlockSandwich = (block.number == lastSwap.blockNumber && lastSwap.direction != isBuy);
         bool isMultiBlockSandwich = (
-            block.number > lastSwap.blockNumber &&
-            block.number <= (lastSwap.blockNumber + MULTI_BLOCK_SANDWICH_WINDOW) &&
-            lastSwap.direction != isBuy
+            block.number > lastSwap.blockNumber && block.number <= (lastSwap.blockNumber + MULTI_BLOCK_SANDWICH_WINDOW)
+                && lastSwap.direction != isBuy
         );
         return (multiAddrAttack || _userData[user].isFeeAddress || isSingleBlockSandwich || isMultiBlockSandwich);
     }
@@ -404,14 +405,14 @@ contract MEVChargeHook is BaseHook, Ownable {
         uint32[] memory secondsAgos = new uint32[](2);
         secondsAgos[0] = 60;
         secondsAgos[1] = 0;
-        (int56[] memory tickCumulatives, ) = IUniswapV4PoolExtended(poolAddr).observe(secondsAgos);
+        (int56[] memory tickCumulatives,) = IUniswapV4PoolExtended(poolAddr).observe(secondsAgos);
         int24 twapTick = int24((tickCumulatives[1] - tickCumulatives[0]) / 60);
-        uint256 priceNow  = _tickToPrice(currentTick);
+        uint256 priceNow = _tickToPrice(currentTick);
         uint256 priceTWAP = _tickToPrice(twapTick);
         if (priceTWAP == 0 || priceNow <= priceTWAP) {
             return 0;
         }
-        uint256 diff   = priceNow - priceTWAP;
+        uint256 diff = priceNow - priceTWAP;
         uint256 feeBPS = (diff * 10000) / priceTWAP;
         if (feeBPS > _NULL_FEE_CAP) feeBPS = _NULL_FEE_CAP;
         nullFee = uint24(feeBPS);
@@ -466,20 +467,15 @@ contract MEVChargeHook is BaseHook, Ownable {
     }
 
     // -------------------------------- Fee Accrual & Distribution ------------------------------
-    function _accrueFees(
-        bytes32 poolId,
-        uint128 token0Amount,
-        uint128 token1Amount
-    ) internal {
+    function _accrueFees(bytes32 poolId, uint128 token0Amount, uint128 token1Amount) internal {
         poolFees[poolId].token0Fees += token0Amount;
         poolFees[poolId].token1Fees += token1Amount;
     }
 
-    function distributeFees(
-        bytes32 poolId,
-        address[] calldata lpAddresses,
-        uint256[] calldata lpShares
-    ) external onlyOwner {
+    function distributeFees(bytes32 poolId, address[] calldata lpAddresses, uint256[] calldata lpShares)
+        external
+        onlyOwner
+    {
         require(lpAddresses.length == lpShares.length, "Mismatched arrays");
         PoolFees storage fees = poolFees[poolId];
         uint256 totalShares;
