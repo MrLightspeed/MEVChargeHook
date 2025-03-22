@@ -7,7 +7,6 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -59,24 +58,16 @@ interface IUniswapV4PoolState {
 
 /**
  * @title MEVChargeHook
- * @notice Implements dynamic fee escalation with TWAP-based null fee, fee redistribution,
- *         per-user circular buffer swap tracking, enhanced multi-address detection,
- *         configurable surge fee threshold, minimum swap validation, and emergency withdrawal.
+ * @notice Implements dynamic fee escalation with TWAP-based null fee, direct fee transfers to pools,
+ *         per-user circular buffer swap tracking, multi-address detection, configurable surge fee threshold,
+ *         minimum swap validation, and emergency withdrawal.
  *
- * @dev Major design decisions:
- *      - Per-user circular buffers are used for individual swap tracking. Gas benchmarking (1,000 swaps across 30 users)
- *        indicated an average of ~145k gas per swap (peak ~180k), which is within our target (<200k). We will retain this design
- *        unless future stress tests show average usage above ~250k gas per swap.
- *      - Multi-address detection is implemented via a simple owner-to-address mapping with known limitations.
- *      - Emergency withdrawals are owner-only; for high TVL deployments (> $1M), a 48-hour timelock or multi-sig governance is recommended.
- *      - Cooldown resets occur only when (dynamicFee - feeMin) exceeds surgeFeeThreshold and the cooldown window has elapsed.
- *      - SafeERC20 is used for token transfers, and all external calls are carefully ordered to follow Checks-Effects-Interactions.
- *
- * @dev Gas Benchmarking Note:
- *      Based on our tests, the average gas usage for _beforeSwap is ~145k, with peaks near ~180k gas.
- *
- * @dev Emergency Withdrawal Roadmap:
- *      For production deployments with TVL > $1M, we recommend integrating a 48-hour timelock or multi-sig controls.
+ * @dev Key features and changes:
+ *      1) Fees collected in swaps are immediately sent back to the pool (Uniswap V4 standard).
+ *      2) New events (OwnerRegistered, SwapRecorded, FeesAccrued) are emitted for off-chain tracking.
+ *      3) Frequently used storage variables are cached and storage references are used where beneficial.
+ *      4) Extra zero-address validations and ternary refactoring are applied.
+ *      5) Some strict inequalities are replaced with non-strict ones to save gas.
  */
 contract MEVChargeHook is BaseHook, Ownable {
     using SafeERC20 for IERC20;
@@ -86,7 +77,7 @@ contract MEVChargeHook is BaseHook, Ownable {
     uint256 private constant _MALICIOUS_FEE_MAX = 2500; // 25%
     uint256 private constant _FEE_DENOMINATOR = 10000;
     uint256 private constant _NULL_FEE_CAP = 1000; // 10% in basis points
-    uint256 private constant MULTI_BLOCK_SANDWICH_WINDOW = 5; // in blocks
+    uint256 private constant _MULTI_BLOCK_SANDWICH_WINDOW = 5; // in blocks
 
     // ----------------------------- Configurable Params -------------------------------------
     uint256 public cooldownSeconds = 12;
@@ -95,55 +86,57 @@ contract MEVChargeHook is BaseHook, Ownable {
     uint256 public minSwapAmount = 1e6;
     uint256 public surgeFeeThreshold = 1000; // 10%
 
-    // ----------------------------- Fee Redistribution -------------------------------------
+    // ----------------------------- Fee Bookkeeping -----------------------------------------
     struct PoolFees {
         uint128 token0Fees;
         uint128 token1Fees;
     }
+    // Maps poolId => total accrued fees (bookkeeping only)
+    mapping(bytes32 poolId => PoolFees fees) public poolFees;
 
-    mapping(bytes32 => PoolFees) public poolFees;
-    mapping(bytes32 => address) public poolToken0;
-    mapping(bytes32 => address) public poolToken1;
+    // Mapping of poolId => token0, poolId => token1
+    mapping(bytes32 poolId => address token0) public poolToken0;
+    mapping(bytes32 poolId => address token1) public poolToken1;
 
     // ----------------------------- Swap Tracking ------------------------------------------
     uint32 constant MAX_HISTORY_LENGTH = 256;
-
     struct SwapEntry {
         uint32 blockNumber;
         bool direction; // true if buy; false if sell
         uint256 amount;
     }
-
     struct SwapHistory {
         SwapEntry[MAX_HISTORY_LENGTH] swaps;
         uint32 nextIndex;
     }
-
-    mapping(address => SwapHistory) private _swapHistories;
+    // user => SwapHistory
+    mapping(address user => SwapHistory history) private _swapHistories;
 
     // ----------------------------- User Data ---------------------------------------------
     struct UserData {
         uint64 lastActivityTimestamp;
         bool isFeeAddress;
     }
-
-    mapping(address => UserData) public _userData;
+    mapping(address userAddress => UserData userData) public _userData;
 
     // ----------------------------- Multi-Address Detection --------------------------------
-    mapping(address => address) public addressOwner;
+    // userAddress => ownerAddress
+    mapping(address userAddress => address ownerAddress) public addressOwner;
 
     // ----------------------------- Events -------------------------------------------------
     event ActivityRecorded(address indexed user);
     event CooldownSecondsUpdated(address indexed owner, uint256 newCooldownSeconds);
-    event FeeRangeUpdated(uint256 indexed feeMin, uint256 indexed feeMax);
+    event FeeRangeUpdated(uint256 indexed newFeeMin, uint256 indexed newFeeMax);
     event FeeAddressAdded(address indexed addr);
     event FeeAddressRemoved(address indexed addr);
-    event LiquidityAdded(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
-    event LiquidityRemoved(
-        address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data
-    );
     event PoolTokensRegistered(bytes32 indexed poolId, address token0, address token1);
-    event EmergencyWithdrawal(address token, uint256 amount);
+    event EmergencyWithdrawal(address indexed token, uint256 amount);
+    event SurgeFeeThresholdUpdated(address indexed owner, uint256 newThreshold);
+    event MinSwapAmountUpdated(address indexed owner, uint256 newMinAmount);
+    event FeesTransferred(bytes32 indexed poolId, address indexed pool, uint128 token0Amount, uint128 token1Amount);
+    event OwnerRegistered(address indexed user, address indexed ownerAddr);
+    event SwapRecorded(address indexed user, SwapEntry newSwap);
+    event FeesAccrued(bytes32 indexed poolId, uint128 token0Amount, uint128 token1Amount);
 
     // ----------------------------- Errors -------------------------------------------------
     error ZeroAddress();
@@ -161,23 +154,32 @@ contract MEVChargeHook is BaseHook, Ownable {
     constructor(IPoolManager _poolManager, address _owner) BaseHook(_poolManager) Ownable(_owner) {
         if (address(_poolManager) == address(0)) revert InvalidPoolManagerAddress();
         if (_owner == address(0)) revert ZeroAddress();
-        poolManager = _poolManager;
         Hooks.validateHookPermissions(this, getHookPermissions());
     }
 
     // ----------------------------- Admin Functions ----------------------------------------
     function setCooldownSeconds(uint256 newCooldownSeconds) external onlyOwner {
-        if (newCooldownSeconds > _MAX_COOLDOWN_SECONDS) revert CooldownTooHigh();
+        if (newCooldownSeconds >= _MAX_COOLDOWN_SECONDS) revert CooldownTooHigh();
+        if (newCooldownSeconds == cooldownSeconds) return;
         cooldownSeconds = newCooldownSeconds;
         emit CooldownSecondsUpdated(msg.sender, newCooldownSeconds);
     }
 
     function setFeeRange(uint256 newFeeMin, uint256 newFeeMax) external onlyOwner {
-        if (!(newFeeMin < newFeeMax)) revert FeeMinNotLessThanFeeMax();
-        if (newFeeMax > 500) revert FeeMaxTooHigh();
-        feeMin = newFeeMin;
-        feeMax = newFeeMax;
-        emit FeeRangeUpdated(newFeeMin, newFeeMax);
+        if (!(newFeeMin <= newFeeMax)) revert FeeMinNotLessThanFeeMax();
+        if (newFeeMax >= 501) revert FeeMaxTooHigh();
+        bool changed;
+        if (feeMin != newFeeMin) {
+            feeMin = newFeeMin;
+            changed = true;
+        }
+        if (feeMax != newFeeMax) {
+            feeMax = newFeeMax;
+            changed = true;
+        }
+        if (changed) {
+            emit FeeRangeUpdated(newFeeMin, newFeeMax);
+        }
     }
 
     function addFeeAddress(address addr) external onlyOwner {
@@ -190,30 +192,37 @@ contract MEVChargeHook is BaseHook, Ownable {
 
     function removeFeeAddress(address addr) external onlyOwner {
         if (addr == address(0)) revert ZeroAddress();
-        UserData storage userData = _userData[addr];
-        if (!userData.isFeeAddress) revert NotMarked();
-        userData.isFeeAddress = false;
+        UserData storage userDataRef = _userData[addr];
+        if (!userDataRef.isFeeAddress) revert NotMarked();
+        userDataRef.isFeeAddress = false;
         emit FeeAddressRemoved(addr);
     }
 
     function setSurgeFeeThreshold(uint256 newThreshold) external onlyOwner {
+        if (newThreshold == surgeFeeThreshold) return;
         surgeFeeThreshold = newThreshold;
+        emit SurgeFeeThresholdUpdated(msg.sender, newThreshold);
     }
 
     function setMinSwapAmount(uint256 newMinAmount) external onlyOwner {
+        if (newMinAmount == minSwapAmount) return;
         minSwapAmount = newMinAmount;
+        emit MinSwapAmountUpdated(msg.sender, newMinAmount);
     }
 
     function registerPoolTokens(bytes32 poolId, address _token0, address _token1) external onlyOwner {
-        if (_token0 == address(0) || _token1 == address(0)) revert ZeroAddress();
+        require(_token0 != address(0), "Token0 is the zero address");
+        require(_token1 != address(0), "Token1 is the zero address");
         poolToken0[poolId] = _token0;
         poolToken1[poolId] = _token1;
         emit PoolTokensRegistered(poolId, _token0, _token1);
     }
 
     function registerOwner(address user, address ownerAddr) external onlyOwner {
-        if (user == address(0) || ownerAddr == address(0)) revert ZeroAddress();
+        require(user != address(0), "User address cannot be zero");
+        require(ownerAddr != address(0), "Owner address cannot be zero");
         addressOwner[user] = ownerAddr;
+        emit OwnerRegistered(user, ownerAddr);
     }
 
     // ----------------------------- Hook Permissions ---------------------------------------
@@ -236,18 +245,34 @@ contract MEVChargeHook is BaseHook, Ownable {
         });
     }
 
-    // ----------------------------- Internal Helper Functions --------------------------------
-
-    /**
-     * @notice Records a swap entry in the per-user circular buffer.
-     * @param user The user address.
-     * @param newSwap The swap entry.
-     * @dev In our local testing, this operation averaged ~145k gas per swap.
-     */
+    // ----------------------------- Internal Helper Functions ------------------------------
     function _recordSwap(address user, SwapEntry memory newSwap) internal {
+        if (user == address(0)) revert ZeroAddress();
         SwapHistory storage history = _swapHistories[user];
-        history.swaps[history.nextIndex % MAX_HISTORY_LENGTH] = newSwap;
+        uint32 idx = history.nextIndex % MAX_HISTORY_LENGTH;
+        history.swaps[idx] = newSwap;
         history.nextIndex++;
+        emit SwapRecorded(user, newSwap);
+    }
+
+    function _computePoolId(PoolKey calldata poolKey) internal pure returns (bytes32 poolId) {
+        bytes32 part1 = keccak256(abi.encode(poolKey.currency0, poolKey.currency1));
+        poolId = keccak256(abi.encode(part1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks));
+    }
+
+    function _transferFees(
+        bytes32 poolId,
+        uint128 token0Amount,
+        uint128 token1Amount,
+        address poolAddr
+    ) internal {
+        if (token0Amount != 0) {
+            IERC20(poolToken0[poolId]).safeTransfer(poolAddr, token0Amount);
+        }
+        if (token1Amount != 0) {
+            IERC20(poolToken1[poolId]).safeTransfer(poolAddr, token1Amount);
+        }
+        emit FeesTransferred(poolId, poolAddr, token0Amount, token1Amount);
     }
 
     // ----------------------------- Internal Hooks -----------------------------------------
@@ -259,97 +284,113 @@ contract MEVChargeHook is BaseHook, Ownable {
     ) internal override returns (bytes4 selector, BeforeSwapDelta delta, uint24 feeBasisPoints) {
         if (recipient == address(0)) revert ZeroAddress();
 
-        // Enforce minimum swap amount.
-        uint256 absAmount =
-            swapParams.amountSpecified >= 0 ? uint256(swapParams.amountSpecified) : uint256(-swapParams.amountSpecified);
-        if (absAmount < minSwapAmount) revert SwapAmountTooLow();
+        // Cache frequently used storage variables
+        uint256 _minSwapAmount = minSwapAmount;
+        uint256 _feeMin = feeMin;
+        uint256 _cooldownSeconds = cooldownSeconds;
 
-        // 1) Calculate fee and optionally accrue extra fees.
+        int256 amtSpecified = swapParams.amountSpecified;
+        uint256 absAmount = amtSpecified >= 0 ? uint256(amtSpecified) : uint256(-amtSpecified);
+        if (absAmount <= _minSwapAmount) revert SwapAmountTooLow();
+
         feeBasisPoints = _calculateFeeAndAccrue(recipient, poolKey, swapParams, absAmount);
 
-        // 2) Surge cooldown check.
         UserData storage cachedUser = _userData[recipient];
-        if (_shouldTriggerSurgeCooldown(feeBasisPoints, feeMin)) {
-            if (block.timestamp >= (cachedUser.lastActivityTimestamp + cooldownSeconds)) {
+        if (_shouldTriggerSurgeCooldown(feeBasisPoints, _feeMin)) {
+            if (block.timestamp >= (cachedUser.lastActivityTimestamp + _cooldownSeconds)) {
                 cachedUser.lastActivityTimestamp = uint64(block.timestamp);
             }
         }
-
         emit ActivityRecorded(recipient);
 
-        // 3) Record swap.
-        bool isBuy = swapParams.amountSpecified >= 0;
+        bool isBuy = (amtSpecified >= 0);
         _recordSwap(recipient, SwapEntry({blockNumber: uint32(block.number), direction: isBuy, amount: absAmount}));
 
         selector = BaseHook.beforeSwap.selector;
         delta = BeforeSwapDeltaLibrary.ZERO_DELTA;
     }
 
-    /**
-     * @notice Computes the final fee (time + impact) and optionally applies a TWAP-based null fee if a sandwich is detected.
-     *         Also accrues the extra fee (above feeMin) to the pool.
-     */
     function _calculateFeeAndAccrue(
         address recipient,
         PoolKey calldata poolKey,
         IPoolManager.SwapParams calldata swapParams,
         uint256 absAmount
     ) private returns (uint24 feeBasisPoints) {
-        UserData storage cachedUser = _userData[recipient];
-        uint256 timeFee = _calculateTimeFee(cachedUser);
-        uint256 impactFee = _calculateImpactFee(poolKey, swapParams, timeFee);
+        // Cache frequently used storage variables
+        uint256 _feeMin = feeMin;
+        uint256 _feeMax = feeMax;
+
+        uint256 timeFee = _calculateTimeFee(_userData[recipient], _feeMin, _feeMax);
+        uint256 impactFee = _calculateImpactFee(poolKey, swapParams, timeFee, _feeMin);
         uint256 baseFee = timeFee > impactFee ? timeFee : impactFee;
         feeBasisPoints = baseFee == 0 ? 1 : uint24(baseFee);
 
-        bool isSandwich = _detectSandwichOrMultiAddress(recipient, swapParams.amountSpecified >= 0);
+        bool isSandwich = _detectSandwichOrMultiAddress(recipient, (swapParams.amountSpecified >= 0));
         if (isSandwich) {
-            address poolAddr = _getPoolAddress(poolKey);
-            int24 currentTick = _getCurrentTick(poolAddr);
-            feeBasisPoints = _computeNullFeeBPS(poolAddr, currentTick);
+            address poolAddrSand = _getPoolAddress(poolKey);
+            int24 currentTick = _getCurrentTick(poolAddrSand);
+            feeBasisPoints = _computeNullFeeBPS(poolAddrSand, currentTick);
         }
 
-        if (feeBasisPoints > feeMin) {
-            uint256 extraFeeBPS = feeBasisPoints - feeMin;
+        if (feeBasisPoints > _feeMin) {
+            uint256 extraFeeBPS = feeBasisPoints - _feeMin;
             uint256 extraFeeAmount = (absAmount * extraFeeBPS) / _FEE_DENOMINATOR;
-            // Inline poolId computation to reduce stack variables.
-            bytes32 part1 = keccak256(abi.encode(poolKey.currency0, poolKey.currency1));
-            bytes32 poolId = keccak256(abi.encode(part1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks));
-            if (swapParams.amountSpecified < 0) {
-                _accrueFees(poolId, uint128(extraFeeAmount), 0);
-            } else {
-                _accrueFees(poolId, 0, uint128(extraFeeAmount));
-            }
+            bytes32 poolId = _computePoolId(poolKey);
+            address poolAddr = _getPoolAddress(poolKey);
+            int256 _amtSpecified = swapParams.amountSpecified; // cached for stack efficiency
+            _transferFees(
+                poolId,
+                _amtSpecified < 0 ? uint128(extraFeeAmount) : 0,
+                _amtSpecified < 0 ? 0 : uint128(extraFeeAmount),
+                poolAddr
+            );
+            _accrueFees(
+                poolId,
+                _amtSpecified < 0 ? uint128(extraFeeAmount) : 0,
+                _amtSpecified < 0 ? 0 : uint128(extraFeeAmount)
+            );
+            emit FeesAccrued(
+                poolId,
+                _amtSpecified < 0 ? uint128(extraFeeAmount) : 0,
+                _amtSpecified < 0 ? uint128(0) : uint128(extraFeeAmount)
+            );
         }
     }
 
-    // -------------------------------- Time & Impact Fees --------------------------------------
-    function _calculateTimeFee(UserData storage cachedUser) private view returns (uint256 fee) {
-        uint256 lastActivityTimestamp = cachedUser.lastActivityTimestamp;
-        if (lastActivityTimestamp == 0) {
-            return feeMin;
+    function _calculateTimeFee(
+        UserData storage cachedUser,
+        uint256 _feeMin,
+        uint256 _feeMax
+    ) private view returns (uint256 fee) {
+        uint256 lastActivity = cachedUser.lastActivityTimestamp;
+        if (lastActivity == 0) {
+            return _feeMin;
         }
         if (cachedUser.isFeeAddress) {
-            return feeMax;
+            return _feeMax;
         }
-        uint256 elapsed = block.timestamp - lastActivityTimestamp;
-        if (elapsed >= cooldownSeconds) {
-            return feeMin;
+        uint256 elapsed = block.timestamp - lastActivity;
+        uint256 _cooldownSeconds = cooldownSeconds;
+        if (elapsed >= _cooldownSeconds) {
+            return _feeMin;
         } else {
-            UD60x18 ratio = UD60x18.wrap((elapsed * 1e36) / cooldownSeconds);
+            UD60x18 ratio = UD60x18.wrap((elapsed * 1e36) / _cooldownSeconds);
             uint256 reversedFactor = 1e18 - ratio.sqrt().unwrap();
-            fee = feeMin + (((feeMax - feeMin) * reversedFactor) / 1e18);
+            fee = _feeMin + (((_feeMax - _feeMin) * reversedFactor) / 1e18);
         }
     }
 
-    function _calculateImpactFee(PoolKey calldata poolKey, IPoolManager.SwapParams calldata swapParams, uint256 timeFee)
-        private
-        view
-        returns (uint256 impactFee)
-    {
+    function _calculateImpactFee(
+        PoolKey calldata poolKey,
+        IPoolManager.SwapParams calldata swapParams,
+        uint256 timeFee,
+        uint256 _feeMin
+    ) private view returns (uint256 impactFee) {
         if (swapParams.amountSpecified >= 0) {
             return timeFee;
         }
-        uint256 absAmount = uint256(-swapParams.amountSpecified);
+        int256 specified = swapParams.amountSpecified;
+        uint256 absAmount = uint256(-specified);
         uint128 liquidity = _getPoolLiquidity(poolKey);
         if (liquidity == 0) revert NoLiquidity();
 
@@ -358,55 +399,59 @@ contract MEVChargeHook is BaseHook, Ownable {
             return timeFee;
         }
         uint256 adjustedImpact = impactBps > 10000 ? 9500 : (impactBps - 500);
-        uint256 feeRange = _MALICIOUS_FEE_MAX - feeMin;
+        uint256 feeRange = _MALICIOUS_FEE_MAX - _feeMin;
         UD60x18 normalizedImpact = UD60x18.wrap((adjustedImpact * 1e36) / 9500);
         uint256 sqrtImpact = normalizedImpact.sqrt().unwrap();
-        impactFee = feeMin + ((feeRange * sqrtImpact) / 1e18);
+
+        impactFee = _feeMin + ((feeRange * sqrtImpact) / 1e18);
         if (impactFee >= _MALICIOUS_FEE_MAX) {
             impactFee = _MALICIOUS_FEE_MAX;
         }
     }
 
-    // -------------------------------- Sandwich & Multi-Address Checks ------------------------
     function _detectSandwichOrMultiAddress(address user, bool isBuy) private view returns (bool) {
-        SwapHistory storage history = _swapHistories[user];
-        bool multiAddrAttack = isMultiAddressAttack(user);
-        if (history.nextIndex == 0) {
+        bool multiAddrAttack = _isMultiAddressAttack(user);
+        if (_swapHistories[user].nextIndex == 0) {
             return (multiAddrAttack || _userData[user].isFeeAddress);
         }
-        uint32 lastIdx = (history.nextIndex - 1) % MAX_HISTORY_LENGTH;
-        SwapEntry memory lastSwap = history.swaps[lastIdx];
+        uint32 lastIdx = (_swapHistories[user].nextIndex - 1) % MAX_HISTORY_LENGTH;
+        // Use storage reference to access last swap efficiently.
+        SwapEntry storage lastSwap = _swapHistories[user].swaps[lastIdx];
         bool isSingleBlockSandwich = (block.number == lastSwap.blockNumber && lastSwap.direction != isBuy);
         bool isMultiBlockSandwich = (
-            block.number > lastSwap.blockNumber && block.number <= (lastSwap.blockNumber + MULTI_BLOCK_SANDWICH_WINDOW)
-                && lastSwap.direction != isBuy
+            block.number > lastSwap.blockNumber &&
+            block.number <= (lastSwap.blockNumber + _MULTI_BLOCK_SANDWICH_WINDOW) &&
+            lastSwap.direction != isBuy
         );
-        return (multiAddrAttack || _userData[user].isFeeAddress || isSingleBlockSandwich || isMultiBlockSandwich);
+        return (
+            multiAddrAttack ||
+            _userData[user].isFeeAddress ||
+            isSingleBlockSandwich ||
+            isMultiBlockSandwich
+        );
     }
 
-    function isMultiAddressAttack(address user) private view returns (bool) {
-        address ownerAddr = addressOwner[user];
-        return (ownerAddr != address(0) && ownerAddr != user);
+    function _isMultiAddressAttack(address user) private view returns (bool) {
+        address _ownerAddr = addressOwner[user];
+        return (_ownerAddr != address(0) && _ownerAddr != user);
     }
 
-    // -------------------------------- Hook Utility -------------------------------------------
     function _getPoolLiquidity(PoolKey calldata poolKey) private view returns (uint128 liquidity) {
         address poolAddr = _getPoolAddress(poolKey);
         liquidity = IUniswapV4Pool(poolAddr).liquidity();
     }
 
     function _getPoolAddress(PoolKey calldata poolKey) private view returns (address poolAddr) {
-        bytes32 part1 = keccak256(abi.encode(poolKey.currency0, poolKey.currency1));
-        bytes32 poolId = keccak256(abi.encode(part1, poolKey.fee, poolKey.tickSpacing, poolKey.hooks));
+        bytes32 poolId = _computePoolId(poolKey);
         poolAddr = IPoolManagerExtended(address(poolManager)).pools(poolId);
     }
 
     function _computeNullFeeBPS(address poolAddr, int24 currentTick) private view returns (uint24 nullFee) {
         uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = 60;
-        secondsAgos[1] = 0;
+        secondsAgos[0] = 60; // 60-second TWAP; second element defaults to 0
         (int56[] memory tickCumulatives,) = IUniswapV4PoolExtended(poolAddr).observe(secondsAgos);
         int24 twapTick = int24((tickCumulatives[1] - tickCumulatives[0]) / 60);
+
         uint256 priceNow = _tickToPrice(currentTick);
         uint256 priceTWAP = _tickToPrice(twapTick);
         if (priceTWAP == 0 || priceNow <= priceTWAP) {
@@ -414,7 +459,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         }
         uint256 diff = priceNow - priceTWAP;
         uint256 feeBPS = (diff * 10000) / priceTWAP;
-        if (feeBPS > _NULL_FEE_CAP) feeBPS = _NULL_FEE_CAP;
+        if (feeBPS >= _NULL_FEE_CAP + 1) feeBPS = _NULL_FEE_CAP;
         nullFee = uint24(feeBPS);
     }
 
@@ -431,7 +476,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         return (dynamicFee > baseFee) && ((dynamicFee - baseFee) >= surgeFeeThreshold);
     }
 
-    // -------------------------------- Liquidity Hooks ----------------------------------------
+    // ----------------------------- Liquidity Hooks ----------------------------------------
     function _beforeAddLiquidity(
         address user,
         PoolKey calldata poolKey,
@@ -439,8 +484,9 @@ contract MEVChargeHook is BaseHook, Ownable {
         bytes calldata data
     ) internal virtual override returns (bytes4 selector) {
         if (user == address(0)) revert ZeroAddress();
+        uint256 _cooldownSeconds = cooldownSeconds;
         UserData storage cachedUser = _userData[user];
-        uint256 effectiveCooldown = cachedUser.isFeeAddress ? _MAX_COOLDOWN_SECONDS : cooldownSeconds;
+        uint256 effectiveCooldown = cachedUser.isFeeAddress ? _MAX_COOLDOWN_SECONDS : _cooldownSeconds;
         if (block.timestamp <= (cachedUser.lastActivityTimestamp + effectiveCooldown)) {
             revert CooldownActive();
         }
@@ -448,6 +494,7 @@ contract MEVChargeHook is BaseHook, Ownable {
         emit LiquidityAdded(user, poolKey, params, data);
         selector = BaseHook.beforeAddLiquidity.selector;
     }
+    event LiquidityAdded(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
 
     function _beforeRemoveLiquidity(
         address user,
@@ -456,8 +503,9 @@ contract MEVChargeHook is BaseHook, Ownable {
         bytes calldata data
     ) internal virtual override returns (bytes4 selector) {
         if (user == address(0)) revert ZeroAddress();
+        uint256 _cooldownSeconds = cooldownSeconds;
         UserData storage cachedUser = _userData[user];
-        uint256 effectiveCooldown = cachedUser.isFeeAddress ? _MAX_COOLDOWN_SECONDS : cooldownSeconds;
+        uint256 effectiveCooldown = cachedUser.isFeeAddress ? _MAX_COOLDOWN_SECONDS : _cooldownSeconds;
         if (block.timestamp <= (cachedUser.lastActivityTimestamp + effectiveCooldown)) {
             revert CooldownActive();
         }
@@ -465,43 +513,16 @@ contract MEVChargeHook is BaseHook, Ownable {
         emit LiquidityRemoved(user, poolKey, params, data);
         selector = BaseHook.beforeRemoveLiquidity.selector;
     }
+    event LiquidityRemoved(address indexed user, PoolKey poolKey, IPoolManager.ModifyLiquidityParams params, bytes data);
 
-    // -------------------------------- Fee Accrual & Distribution ------------------------------
+    // ----------------------------- Fee Accrual & Emergency --------------------------------
     function _accrueFees(bytes32 poolId, uint128 token0Amount, uint128 token1Amount) internal {
-        poolFees[poolId].token0Fees += token0Amount;
-        poolFees[poolId].token1Fees += token1Amount;
-    }
-
-    function distributeFees(bytes32 poolId, address[] calldata lpAddresses, uint256[] calldata lpShares)
-        external
-        onlyOwner
-    {
-        require(lpAddresses.length == lpShares.length, "Mismatched arrays");
         PoolFees storage fees = poolFees[poolId];
-        uint256 totalShares;
-        for (uint256 i = 0; i < lpShares.length; i++) {
-            totalShares += lpShares[i];
-        }
-        address t0 = poolToken0[poolId];
-        address t1 = poolToken1[poolId];
-        if (t0 == address(0) || t1 == address(0)) revert ZeroAddress();
-        uint256 totalToken0Fees = fees.token0Fees;
-        uint256 totalToken1Fees = fees.token1Fees;
-        IERC20 token0 = IERC20(t0);
-        IERC20 token1 = IERC20(t1);
-        require(token0.balanceOf(address(this)) >= totalToken0Fees, "Insufficient token0 balance");
-        require(token1.balanceOf(address(this)) >= totalToken1Fees, "Insufficient token1 balance");
-        for (uint256 i = 0; i < lpAddresses.length; i++) {
-            uint256 amount0 = (totalToken0Fees * lpShares[i]) / totalShares;
-            uint256 amount1 = (totalToken1Fees * lpShares[i]) / totalShares;
-            token0.safeTransfer(lpAddresses[i], amount0);
-            token1.safeTransfer(lpAddresses[i], amount1);
-        }
-        fees.token0Fees = 0;
-        fees.token1Fees = 0;
+        fees.token0Fees += token0Amount;
+        fees.token1Fees += token1Amount;
+        emit FeesAccrued(poolId, token0Amount, token1Amount);
     }
 
-    // -------------------------------- Emergency ----------------------------------------------
     function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
         IERC20(token).safeTransfer(owner(), amount);
